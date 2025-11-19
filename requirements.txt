@@ -1,0 +1,11 @@
+tensorflow
+xarray
+numpy
+scikit-image
+matplotlib
+jupyter
+h5py
+pandas
+scikit-learn
+netcdf4
+seaborn
