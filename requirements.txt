@@ -9,3 +9,4 @@ pandas
 scikit-learn
 netcdf4
 seaborn
+fastapi[all]
