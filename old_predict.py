@@ -1,19 +1,24 @@
 import os
 import glob
 import numpy as np
-import xarray as xr
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from skimage.transform import resize
+import xarray as xr
+import matplotlib.colors as mcolors
+import seaborn as sns
 
-# Configuration - keep consistent with train_module.py
+# Set the style for seaborn
+sns.set_theme(style='whitegrid')
+
+# Configuration (must match train_module.py preprocessing)
 folder = "data"
 memmap_path = "sst_memmap.dat"
 history = 5
-down_H, down_W = 256, 540
-patch_h, patch_w = 64, 64
-stride_h, stride_w = 32, 32
-predict_batch = 64  # how many patches to predict per model call
+down_H, down_W = 512, 1080
+patch_h, patch_w = 128, 128
+stride_h, stride_w = 64, 64
+predict_batch = 64
 
 def compute_global_min_max(nc_files):
     gmin = np.inf
@@ -30,83 +35,54 @@ def compute_global_min_max(nc_files):
 
 def build_coords(T):
     H, W = down_H, down_W
-    n_y = (H - patch_h) // stride_h + 1
-    n_x = (W - patch_w) // stride_w + 1
+
+    # Ensure coverage to the image edges: include last patch aligned to the right/bottom edge
+    def make_positions(length, patch, stride):
+        pos = list(range(0, length - patch + 1, stride))
+        if pos[-1] != length - patch:
+            pos.append(length - patch)
+        return np.array(pos, dtype=np.int32)
+
+    ys = make_positions(H, patch_h, stride_h)
+    xs = make_positions(W, patch_w, stride_w)
+
+    n_y = len(ys)
+    n_x = len(xs)
     patches_per_frame = n_y * n_x
     n_windows = T - history
     starts = np.arange(0, n_windows, dtype=np.int64)
-    ys = np.arange(0, H - patch_h + 1, stride_h, dtype=np.int32)
-    xs = np.arange(0, W - patch_w + 1, stride_w, dtype=np.int32)
+
     starts_grid = np.repeat(starts, patches_per_frame)
     ys_tile = np.tile(np.repeat(ys, n_x), n_windows)
     xs_tile = np.tile(np.tile(xs, n_y), n_windows)
     coords = np.stack([starts_grid, ys_tile, xs_tile], axis=1)
     return coords, n_y, n_x, n_windows
 
-def load_patch_window_from_memmap(start_y_x, T):
-    start, y, x = int(start_y_x[0]), int(start_y_x[1]), int(start_y_x[2])
-    mm = np.memmap(memmap_path, dtype=np.float16, mode='r', shape=(T, down_H, down_W))
-    patches = np.empty((history + 1, patch_h, patch_w), dtype=np.float32)
-    for t in range(history + 1):
-        frame = np.array(mm[start + t], dtype=np.float32)
-        patches[t] = frame[y:y+patch_h, x:x+patch_w]
-    del mm
-    X = patches[:history][..., np.newaxis].astype(np.float32)
-    Y = patches[history][..., np.newaxis].astype(np.float32)
-    return X, Y
-
 def load_batch_X(coords_batch, T):
     Xs = np.empty((len(coords_batch), history, patch_h, patch_w, 1), dtype=np.float32)
+    mm = np.memmap(memmap_path, dtype=np.float16, mode='r', shape=(T, down_H, down_W))
     for i, c in enumerate(coords_batch):
-        X, _ = load_patch_window_from_memmap(c, T)
-        Xs[i] = X
+        start, y, x = int(c[0]), int(c[1]), int(c[2])
+        patches = np.empty((history, patch_h, patch_w), dtype=np.float32)
+        for t in range(history):
+            frame = np.array(mm[start + t], dtype=np.float32)
+            patches[t] = frame[y:y+patch_h, x:x+patch_w]
+        Xs[i] = patches[..., np.newaxis]
+    del mm
     return Xs
 
-def reconstruct_full_frame_from_patches(preds, coords_used, frame_index, H=down_H, W=down_W):
+def reconstruct_full_frame_from_patches(preds, coords_used, H=down_H, W=down_W):
     acc = np.zeros((H, W), dtype=np.float32)
     counts = np.zeros((H, W), dtype=np.float32)
     for pred, c in zip(preds, coords_used):
-        start, y, x = int(c[0]), int(c[1]), int(c[2])
-        # pred shape (patch_h, patch_w, 1)
+        y, x = int(c[1]), int(c[2])
         patch = pred[..., 0]
         acc[y:y+patch_h, x:x+patch_w] += patch
         counts[y:y+patch_h, x:x+patch_w] += 1.0
-    # avoid divide by zero
-    mask = counts == 0
-    counts[mask] = 1.0
-    full = acc / counts
-    return full
-
-def plot_sequence_and_prediction(X_seq, Y_true, Y_pred, vmin=0.0, vmax=1.0, cmap='coolwarm'):
-    frames = X_seq.shape[0]
-    cols = frames + 2
-    fig, axs = plt.subplots(1, cols, figsize=(3*cols, 3))
-    for i in range(frames):
-        ax = axs[i]
-        ax.imshow(X_seq[i,...,0], origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
-        ax.set_title(f'Input t-{frames-i}')
-        ax.axis('off')
-    axs[frames].imshow(Y_true[...,0], origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
-    axs[frames].set_title('Ground truth')
-    axs[frames].axis('off')
-    axs[frames+1].imshow(Y_pred[...,0], origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
-    axs[frames+1].set_title('Prediction (patch)')
-    axs[frames+1].axis('off')
-    plt.tight_layout()
-    plt.show()
-
-def plot_full_frame(original_full, predicted_full, vmin=None, vmax=None, cmap='coolwarm'):
-    if vmin is None: vmin = float(min(original_full.min(), predicted_full.min()))
-    if vmax is None: vmax = float(max(original_full.max(), predicted_full.max()))
-    fig, axs = plt.subplots(1,2, figsize=(12,6))
-    axs[0].imshow(original_full, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
-    axs[0].set_title('Original / Ground truth full frame')
-    axs[0].axis('off')
-    axs[1].imshow(predicted_full, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto')
-    axs[1].set_title('Predicted full frame')
-    axs[1].axis('off')
-    plt.tight_layout()
-    plt.show()
+    # mark positions never covered by any patch as nan so they plot as "bad" values
+    with np.errstate(invalid='ignore', divide='ignore'):
+        avg = np.where(counts > 0, acc / counts, np.nan)
+    return avg, counts
 
 if __name__ == "__main__":
     model_path = "models/best_model.keras"
@@ -124,19 +100,11 @@ if __name__ == "__main__":
 
     coords, n_y, n_x, n_windows = build_coords(T)
 
-    # choose a temporal window (last available window) and predict full frame for that window
-    # start index selects which temporal window to use (0..n_windows-1). Use the last available.
+    # pick last temporal window to predict full-frame for the most recent target time
     temporal_start = n_windows - 1
-    # filter coords for the chosen temporal start
     coords_for_start = coords[coords[:,0] == temporal_start]
 
-    # prepare ground-truth full frame (assemble patches from memmap to a full frame for the chosen start)
-    mm = np.memmap(memmap_path, dtype=np.float16, mode='r', shape=(T, down_H, down_W))
-    ground_full = np.array(mm[temporal_start + history], dtype=np.float32)  # the true full frame at target time (normalized)
-    del mm
-    ground_full_un = ground_full * scale + global_min
-
-    # predict patches in batches and reconstruct
+    # predict patches in batches
     preds_list = []
     coords_used = []
     for i in range(0, coords_for_start.shape[0], predict_batch):
@@ -147,21 +115,44 @@ if __name__ == "__main__":
         coords_used.extend(batch_coords.tolist())
     preds_all = np.concatenate(preds_list, axis=0)
 
-    # reconstruct full normalized predicted frame
-    pred_full_norm = reconstruct_full_frame_from_patches(preds_all, coords_used, temporal_start, H=down_H, W=down_W)
+    # reconstruct full normalized prediction and un-normalize
+    pred_full_norm, counts = reconstruct_full_frame_from_patches(preds_all, coords_used, H=down_H, W=down_W)
     pred_full_un = pred_full_norm * scale + global_min
 
-    # also show one random patch example (inputs + ground truth + patch prediction)
-    sample_idx = np.random.randint(0, coords_for_start.shape[0])
-    sample_coord = coords_for_start[sample_idx]
-    X_sample, Y_sample = load_patch_window_from_memmap(sample_coord, T)
-    Y_sample_pred = model.predict(np.expand_dims(X_sample, axis=0))[0]
+    # guard against any NaN/inf (keep NaNs so they map to white)
+    pred_full_un = np.asarray(pred_full_un, dtype=np.float32)
 
-    # plot patch sequence and patch prediction (un-normalized)
-    X_sample_un = X_sample * scale + global_min
-    Y_sample_un = Y_sample * scale + global_min
-    Y_sample_pred_un = Y_sample_pred * scale + global_min
-    plot_sequence_and_prediction(X_sample_un, Y_sample_un, Y_sample_pred_un, vmin=global_min, vmax=global_max)
+    # display only the full predicted map (center colormap at 0 -> white)
+    cmap = plt.get_cmap('bwr')
+    cmap.set_bad('white')              # make NaNs white
+    norm = mcolors.TwoSlopeNorm(vmin=float(global_min), vcenter=0.0, vmax=float(global_max))
 
-    # plot full frame comparison
-    plot_full_frame(ground_full_un, pred_full_un, vmin=global_min, vmax=global_max)
+    print(f"Global min: {global_min}, Global max: {global_max}")
+
+    plt.figure(figsize=(10, 6))
+    # use nearest interpolation to avoid thin artifact lines from interpolation
+    plt.imshow(pred_full_un, origin='lower', cmap=cmap, norm=norm, interpolation='nearest', aspect='auto')
+
+    num_to_show = 6
+    rows, cols = 2, 3
+
+    plt.figure(figsize=(cols * 3, rows * 3))
+
+    for i in range(num_to_show):
+        patch_un = preds_all[i, :, :, 0] * scale + global_min  # un-normalize
+        y, x = coords_used[i][1], coords_used[i][2]
+
+        ax = plt.subplot(rows, cols, i + 1)
+        ax.imshow(
+            patch_un,
+            cmap=cmap,
+            norm=norm,
+            origin='lower',
+            interpolation='nearest'
+        )
+        ax.set_title(f"({y},{x})", fontsize=8)
+        ax.axis('off')
+
+    plt.suptitle("Six Predicted Patches (2×3 Grid)")
+    plt.tight_layout()
+    plt.show()
