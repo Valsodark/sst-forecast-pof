@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 # --- Configuration (must match your preprocessing) ---
-folder = "data"
+folder = "data-pred-files"
 memmap_path = "sst_memmap.dat"
 history = 5
 down_H, down_W = 512, 1080
